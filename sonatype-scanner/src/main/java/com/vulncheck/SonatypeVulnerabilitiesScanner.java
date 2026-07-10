@@ -1,224 +1,307 @@
 package com.vulncheck;
 
 import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 
-import java.io.IOException;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.nio.charset.StandardCharsets;
-import java.time.Duration;
-import java.util.ArrayList;
-import java.util.Base64;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
+import java.util.*;
 
 public class SonatypeVulnerabilitiesScanner implements VulnerabilitiesScanner {
 
-    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
-    private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(30);
-    private static final Duration POLL_INTERVAL = Duration.ofMillis(250);
-    private static final Duration SCAN_TIMEOUT = Duration.ofSeconds(30);
+    public static final String PKG_MANAGER = "maven";
+    private final SonatypeClient sonatypeClient;
+    private static final List<String> REMEDIATION_PRIORITY = List.of(
+            "recommended-non-breaking-with-dependencies",
+            "recommended-non-breaking",
+            "next-no-violations-with-dependencies",
+            "next-no-violations",
+            "next-non-failing-with-dependencies",
+            "next-non-failing"
+    );
 
-    private final String sonatypeApiKey;
-    private final String sonatypeUsername;
-    private final String sonatypePassword;
-    private final String sonatypeUrl;
-    private final HttpClient httpClient;
-
-    public SonatypeVulnerabilitiesScanner(String sonatypeApiKey, String sonatypeUsername, String sonatypePassword, String sonatypeUrl) {
-        this.sonatypeApiKey = sonatypeApiKey;
-        this.sonatypeUsername = sonatypeUsername;
-        this.sonatypePassword = sonatypePassword;
-        this.sonatypeUrl = sonatypeUrl;
-        this.httpClient = HttpClient.newBuilder().connectTimeout(REQUEST_TIMEOUT).build();
+    public SonatypeVulnerabilitiesScanner(SonatypeCredentials sonatypeCredentials) {
+        this.sonatypeClient = new SonatypeClient(sonatypeCredentials);
     }
 
     @Override
     public List<Vulnerability> scanDependencies(int projectId, DependencyNode dependencyNode) {
         Objects.requireNonNull(dependencyNode, "dependencyNode must not be null");
 
-        try {
-            JsonNode submittedScan = send("POST",
-                    "/api/v2/scan/applications/" + projectId + "/sources/cyclonedx?stageId=build",
-                    OBJECT_MAPPER.writeValueAsString(toCycloneDxBom(dependencyNode)));
-            String statusUrl = requiredText(submittedScan, "statusUrl", "Sonatype did not return a scan status URL");
-            JsonNode scanResult = waitForScan(statusUrl);
-
-            if (scanResult.path("isError").asBoolean(false)) {
-                throw new IllegalStateException("Sonatype scan failed: " + scanResult.path("errorMessage").asText("unknown error"));
+        List<Vulnerability> vulnerabilities = toVulnerabilities(sonatypeClient.scan(projectId, toCycloneDxBom(dependencyNode)));
+        for (Vulnerability vulnerability : vulnerabilities) {
+            Optional<RemediationCandidate> bestCandidate = findBestRemediation(projectId, dependencyNode);
+            if (bestCandidate.isEmpty()) {
+                continue;
             }
+            vulnerability.setRemediationCandidate(bestCandidate.get());
 
-            String reportDataUrl = requiredText(scanResult, "reportDataUrl", "Sonatype did not return a report data URL");
-            return toVulnerabilities(send("GET", reportDataUrl, null));
-        } catch (IOException e) {
-            throw new IllegalStateException("Unable to serialize the Sonatype scan request", e);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("Interrupted while waiting for Sonatype scan results", e);
         }
+        return vulnerabilities;
     }
 
-    private Map<String, Object> toCycloneDxBom(DependencyNode root) {
-        Map<String, DependencyNode> dependencies = new LinkedHashMap<>();
-        collectDependencies(root, dependencies);
+    public Optional<RemediationCandidate> findBestRemediation(
+            int applicationId,
+            DependencyNode dependency
+    ) {
+        JsonNode response = sonatypeClient.getRemediation(
+                applicationId,
+                dependency,
+                "build",
+                true
+        );
 
-        List<Map<String, String>> components = dependencies.values().stream()
-                .map(this::toComponent)
+        List<RemediationCandidate> candidates =
+                toRemediationCandidates(response);
+
+        return selectBestCandidate(
+                candidates,
+                dependency.version()
+        );
+    }
+
+
+    List<RemediationCandidate> toRemediationCandidates(JsonNode response) {
+        if (response == null || response.isNull()) {
+            return List.of();
+        }
+
+        JsonNode changes = response
+                .path("remediation")
+                .path("versionChanges");
+
+        if (!changes.isArray()) {
+            return List.of();
+        }
+
+        List<RemediationCandidate> result = new ArrayList<>();
+
+        for (JsonNode change : changes) {
+            JsonNode component = change
+                    .path("data")
+                    .path("component");
+
+            ComponentCoordinate target = toCoordinate(component);
+
+            if (target == null) {
+                continue;
+            }
+
+            List<ComponentCoordinate> parents =
+                    parseDirectDependencyData(change.path("directDependencyData"));
+
+            result.add(new RemediationCandidate(
+                    change.path("type").asText(null),
+                    target,
+                    change.path("directDependency").asBoolean(true),
+                    parents
+            ));
+        }
+
+        return List.copyOf(result);
+    }
+
+    private ComponentCoordinate toCoordinate(JsonNode component) {
+        JsonNode coordinates = component
+                .path("componentIdentifier")
+                .path("coordinates");
+
+        String groupId = coordinates.path("groupId").asText(null);
+        String artifactId = coordinates.path("artifactId").asText(null);
+        String version = coordinates.path("version").asText(null);
+
+        if (isBlank(groupId) || isBlank(artifactId) || isBlank(version)) {
+            return null;
+        }
+
+        return new ComponentCoordinate(
+                groupId,
+                artifactId,
+                version
+        );
+    }
+
+
+    private List<ComponentCoordinate> parseDirectDependencyData(JsonNode data) {
+        if (!data.isArray()) {
+            return List.of();
+        }
+
+        List<ComponentCoordinate> result = new ArrayList<>();
+
+        for (JsonNode item : data) {
+            ComponentCoordinate coordinate =
+                    toCoordinate(item.path("component"));
+
+            if (coordinate != null) {
+                result.add(coordinate);
+            }
+        }
+
+        return List.copyOf(result);
+    }
+
+    Optional<RemediationCandidate> selectBestCandidate(
+            List<RemediationCandidate> candidates,
+            String currentVersion
+    ) {
+        return candidates.stream()
+                .filter(candidate ->
+                        !currentVersion.equals(candidate.target().version())
+                )
+                .min(Comparator.comparingInt(candidate -> {
+                    int index = REMEDIATION_PRIORITY.indexOf(candidate.type());
+                    return index >= 0 ? index : Integer.MAX_VALUE;
+                }));
+    }
+
+
+    private Map<String, Object> toCycloneDxBom(DependencyNode root) {
+        Objects.requireNonNull(root, "root must not be null");
+
+        Map<String, DependencyNode> componentsByRef = new LinkedHashMap<>();
+        Map<String, Set<String>> relationships = new LinkedHashMap<>();
+
+        collectGraph(root, componentsByRef, relationships);
+
+        String rootRef = root.toPkg(PKG_MANAGER);
+
+        List<Map<String, String>> components = componentsByRef.values().stream()
+                .filter(node -> !node.toPkg(PKG_MANAGER).equals(rootRef))
+                .map(this::toLibraryComponent)
                 .toList();
-        List<Map<String, Object>> relationships = dependencies.values().stream()
-                .map(this::toDependencyRelationship)
+
+        List<Map<String, Object>> dependencyRelationships = relationships.entrySet().stream()
+                .map(entry -> Map.of(
+                        "ref", entry.getKey(),
+                        "dependsOn", List.copyOf(entry.getValue())
+                ))
                 .toList();
 
         return Map.of(
                 "bomFormat", "CycloneDX",
                 "specVersion", "1.5",
                 "version", 1,
+                "metadata", Map.of(
+                        "component", toApplicationComponent(root)
+                ),
                 "components", components,
-                "dependencies", relationships
+                "dependencies", dependencyRelationships
         );
     }
 
-    private void collectDependencies(DependencyNode node, Map<String, DependencyNode> dependencies) {
-        if (node == null || dependencies.putIfAbsent(packageUrl(node), node) != null || node.children() == null) {
+    private void collectGraph(
+            DependencyNode node,
+            Map<String, DependencyNode> components,
+            Map<String, Set<String>> relationships
+    ) {
+        if (node == null) {
             return;
         }
-        node.children().forEach(child -> collectDependencies(child, dependencies));
+
+        String nodeRef = node.toPkg(PKG_MANAGER);
+        components.putIfAbsent(nodeRef, node);
+
+        Set<String> childrenRefs = relationships.computeIfAbsent(
+                nodeRef,
+                ignored -> new LinkedHashSet<>()
+        );
+
+        if (node.children() == null) {
+            return;
+        }
+
+        for (DependencyNode child : node.children()) {
+            if (child == null) {
+                continue;
+            }
+
+            String childRef = child.toPkg(PKG_MANAGER);
+            childrenRefs.add(childRef);
+
+            collectGraph(child, components, relationships);
+        }
     }
 
-    private Map<String, String> toComponent(DependencyNode node) {
-        String packageUrl = packageUrl(node);
+
+    private Map<String, String> toLibraryComponent(DependencyNode node) {
+        String purl = node.toPkg(PKG_MANAGER);
+
         return Map.of(
                 "type", "library",
-                "bom-ref", packageUrl,
+                "bom-ref", purl,
                 "group", node.groupId(),
                 "name", node.artifactId(),
                 "version", node.version(),
-                "purl", packageUrl
+                "purl", purl
         );
     }
 
-    private Map<String, Object> toDependencyRelationship(DependencyNode node) {
-        List<String> children = node.children() == null ? List.of() : node.children().stream()
-                .filter(Objects::nonNull)
-                .map(this::packageUrl)
-                .distinct()
-                .toList();
-        return Map.of("ref", packageUrl(node), "dependsOn", children);
-    }
+    private Map<String, String> toApplicationComponent(DependencyNode node) {
+        String purl = node.toPkg(PKG_MANAGER);
 
-    private String packageUrl(DependencyNode node) {
-        if (isBlank(node.groupId()) || isBlank(node.artifactId()) || isBlank(node.version())) {
-            throw new IllegalArgumentException("Every dependency must have groupId, artifactId, and version");
-        }
-        return "pkg:maven/%s/%s@%s?type=jar".formatted(node.groupId(), node.artifactId(), node.version());
-    }
-
-    private JsonNode waitForScan(String statusUrl) throws InterruptedException {
-        long deadline = System.nanoTime() + SCAN_TIMEOUT.toNanos();
-        while (System.nanoTime() < deadline) {
-            try {
-                return send("GET", statusUrl, null);
-            } catch (SonatypeHttpException e) {
-                if (e.statusCode != 404) {
-                    throw e;
-                }
-                Thread.sleep(POLL_INTERVAL);
-            }
-        }
-        throw new IllegalStateException("Timed out waiting for Sonatype scan results");
-    }
-
-    private JsonNode send(String method, String path, String body) {
-        try {
-            HttpRequest.Builder request = HttpRequest.newBuilder(resolve(path))
-                    .timeout(REQUEST_TIMEOUT)
-                    .header("Accept", "application/json")
-                    .header("X-Api-Key", sonatypeApiKey == null ? "" : sonatypeApiKey);
-            if (!isBlank(sonatypeUsername) || !isBlank(sonatypePassword)) {
-                String credentials = (Objects.toString(sonatypeUsername, "") + ":" + Objects.toString(sonatypePassword, ""));
-                request.header("Authorization", "Basic " + Base64.getEncoder().encodeToString(credentials.getBytes(StandardCharsets.UTF_8)));
-            }
-            if (body != null) {
-                request.header("Content-Type", "application/json")
-                        .method(method, HttpRequest.BodyPublishers.ofString(body));
-            } else {
-                request.method(method, HttpRequest.BodyPublishers.noBody());
-            }
-
-            HttpResponse<String> response = httpClient.send(request.build(), HttpResponse.BodyHandlers.ofString());
-            if (response.statusCode() < 200 || response.statusCode() >= 300) {
-                throw new SonatypeHttpException(response.statusCode(), response.body());
-            }
-            return OBJECT_MAPPER.readTree(response.body());
-        } catch (IOException e) {
-            throw new IllegalStateException("Sonatype request failed", e);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("Interrupted while calling Sonatype", e);
-        }
-    }
-
-    private URI resolve(String path) {
-        URI uri = URI.create(path);
-        if (uri.isAbsolute()) {
-            return uri;
-        }
-        String baseUrl = Objects.requireNonNull(sonatypeUrl, "sonatypeUrl must not be null").replaceAll("/+$", "");
-        return URI.create(baseUrl + "/" + path.replaceFirst("^/+", ""));
+        return Map.of(
+                "type", "application",
+                "bom-ref", purl,
+                "group", node.groupId(),
+                "name", node.artifactId(),
+                "version", node.version(),
+                "purl", purl
+        );
     }
 
     private List<Vulnerability> toVulnerabilities(JsonNode report) {
+        if (report == null || report.isNull()) {
+            return List.of();
+        }
+
         List<Vulnerability> vulnerabilities = new ArrayList<>();
+
         for (JsonNode component : report.path("components")) {
-            JsonNode coordinates = component.path("componentIdentifier").path("coordinates");
-            for (JsonNode issue : component.path("securityData").path("securityIssues")) {
+            JsonNode coordinates = component
+                    .path("componentIdentifier")
+                    .path("coordinates");
+
+            String groupId = coordinates.path("groupId").asText(null);
+            String artifactId = coordinates.path("artifactId").asText(null);
+            String version = coordinates.path("version").asText(null);
+
+            for (JsonNode issue : component
+                    .path("securityData")
+                    .path("securityIssues")) {
+
                 vulnerabilities.add(new Vulnerability(
-                        coordinates.path("artifactId").asText(null),
-                        coordinates.path("groupId").asText(null),
-                        coordinates.path("version").asText(null),
-                        issue.path("threatCategory").asText(issue.path("severity").asText(null)),
-                        issue.path("description").asText(issue.path("reference").asText(null)),
-                        firstPresent(issue, "versionToFix", "fixVersion", "remediation.version")
+                        firstPresent(issue, "reference", "id", "cve"),
+                        groupId,
+                        artifactId,
+                        version,
+                        firstPresent(issue, "threatCategory", "severity"),
+                        firstPresent(issue, "description"),
+                        firstPresent(issue, "url", "reference")
                 ));
             }
         }
+
         return List.copyOf(vulnerabilities);
     }
 
     private String firstPresent(JsonNode node, String... paths) {
         for (String path : paths) {
             JsonNode candidate = node.at("/" + path.replace(".", "/"));
-            if (!candidate.isMissingNode() && !candidate.isNull()) {
-                return candidate.asText();
+
+            if (candidate.isMissingNode() || candidate.isNull()) {
+                continue;
+            }
+
+            String value = candidate.asText(null);
+
+            if (value != null && !value.isBlank()) {
+                return value;
             }
         }
-        return null;
-    }
 
-    private String requiredText(JsonNode node, String field, String message) {
-        String value = node.path(field).asText();
-        if (isBlank(value)) {
-            throw new IllegalStateException(message);
-        }
-        return value;
+        return null;
     }
 
     private boolean isBlank(String value) {
         return value == null || value.isBlank();
-    }
-
-    private static final class SonatypeHttpException extends RuntimeException {
-        private final int statusCode;
-
-        private SonatypeHttpException(int statusCode, String responseBody) {
-            super("Sonatype request failed with HTTP " + statusCode + ": " + responseBody);
-            this.statusCode = statusCode;
-        }
     }
 
 }

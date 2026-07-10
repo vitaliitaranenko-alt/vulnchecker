@@ -21,16 +21,16 @@ public class GraphGenerator {
     public void buildGraph(DependencyNode node, DependencyGraph graph) {
 
         graph.addNode(node);
-        if (visitedNodes.containsKey(node.toPkgWithouthash())) {
-            List<DependencyNode> visited = visitedNodes.get(node.toPkgWithouthash());
+        if (visitedNodes.containsKey(node.toPkgWithouthash("maven"))) {
+            List<DependencyNode> visited = visitedNodes.get(node.toPkgWithouthash("maven"));
             visited.forEach(it -> {
                 graph.addEdge(it, node);
             });
         }
 
-        List<DependencyNode> visited = visitedNodes.getOrDefault(node.toPkgWithouthash(), new ArrayList<>());
+        List<DependencyNode> visited = visitedNodes.getOrDefault(node.toPkgWithouthash("maven"), new ArrayList<>());
         visited.add(node);
-        visitedNodes.put(node.toPkgWithouthash(), visited);
+        visitedNodes.put(node.toPkgWithouthash("maven"), visited);
         for (DependencyNode child : node.children()) {
             graph.addNode(child);
             graph.addEdge(child, node);

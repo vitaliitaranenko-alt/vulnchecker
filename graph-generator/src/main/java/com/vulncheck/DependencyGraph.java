@@ -60,7 +60,7 @@ public record DependencyGraph(
         Path dotPath = dirPath.resolve("temp.dot");
 
 
-        exporter.setVertexAttributeProvider(node -> Map.of("label", DefaultAttribute.createAttribute(node.toPkg())));
+        exporter.setVertexAttributeProvider(node -> Map.of("label", DefaultAttribute.createAttribute(node.toPkg("maven"))));
         try (Writer writer = java.nio.file.Files.newBufferedWriter(dotPath)) {
             exporter.exportGraph(graph, writer);
         } catch (Exception e) {

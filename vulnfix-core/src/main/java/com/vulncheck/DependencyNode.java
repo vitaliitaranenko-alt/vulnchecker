@@ -11,6 +11,8 @@ public record DependencyNode(
         List<DependencyNode> children
 ) {
 
+
+
     public void printNodes(int deps) {
         printNode("", true, deps);
     }
@@ -35,12 +37,12 @@ public record DependencyNode(
         }
     }
 
-    public String toPkg() {
-        return "%s:%s:%s".formatted(groupId, artifactId, version);
+    public String toPkg(String pkgManager) {
+        return "pkg:" + pkgManager + "/%s/%s@%s".formatted(groupId, artifactId, version);
     }
 
-    public String toPkgWithouthash() {
-        return "%s:%s".formatted(groupId, artifactId);
+    public String toPkgWithouthash(String pkgManager) {
+        return "pkg:%s/%s".formatted(groupId, artifactId);
     }
 
 

@@ -10,25 +10,71 @@ import java.util.List;
         description = "A tool to scan and fix vulnerabilities in your project.",
         mixinStandardHelpOptions = true,
         version = "vulnfix 1.0",
-        subcommands = {VulnScanner.ScanCommand.class}
+        subcommands = {VulnScanner.InitCommand.class, VulnScanner.ScanCommand.class}
 )
 public class VulnScanner implements Runnable {
 
     @Override
     public void run() {
-        IO.println("Welcome to VulnFix! Use the 'scan' command to scan your project for vulnerabilities.");
+        System.out.println("Welcome to VulnFix! Run 'vulnfix init' once, then use 'vulnfix scan'.");
     }
 
 
-    static void main(String[] args) {
+    public static void main(String[] args) {
         int exitCode = new CommandLine(new VulnScanner()).execute(args);
         System.exit(exitCode);
+    }
+
+    @CommandLine.Command(
+            name = "init",
+            description = "Create the local Sonatype configuration.",
+            mixinStandardHelpOptions = true
+    )
+    static class InitCommand implements Runnable {
+
+        @CommandLine.Option(names = {"-su", "--sonatype-username"}, required = true,
+                description = "Sonatype username.")
+        private String username;
+
+        @CommandLine.Option(names = {"-sp", "--sonatype-password"}, required = true, interactive = true,
+                description = "Sonatype password.")
+        private String password;
+
+        @CommandLine.Option(names = {"-sa", "--sonatype-api-key"},
+                description = "Optional Sonatype API key.")
+        private String apiKey;
+
+        @CommandLine.Option(names = {"-sb", "--sonatype-base-url"}, required = true,
+                description = "Nexus Lifecycle IQ base URL, for example https://iq.example.com.")
+        private String baseUrl;
+
+        @CommandLine.Option(names = "--request-timeout", defaultValue = "PT30S",
+                description = "HTTP request timeout in ISO-8601 duration format.")
+        private String requestTimeout;
+
+        @CommandLine.Option(names = "--scan-timeout", defaultValue = "PT30S",
+                description = "Total scan wait timeout in ISO-8601 duration format.")
+        private String scanTimeout;
+
+        @CommandLine.Option(names = {"-f", "--force"},
+                description = "Overwrite an existing configuration.")
+        private boolean force;
+
+        @Override
+        public void run() {
+            VulnScannerConfiguration configuration = new VulnScannerConfiguration(
+                    new SonatypeCredentials(username, password, apiKey, baseUrl, requestTimeout, scanTimeout)
+            );
+            Path configPath = new VulnScannerConfigStore().save(configuration, force);
+            System.out.println("Configuration saved to " + configPath);
+        }
     }
 
 
     @CommandLine.Command(
             name = "scan",
-            description = "Scan the project for vulnerabilities."
+            description = "Scan the project for vulnerabilities.",
+            mixinStandardHelpOptions = true
     )
     static class ScanCommand implements Runnable {
 
@@ -44,40 +90,26 @@ public class VulnScanner implements Runnable {
         )
         private Path svgPath;
         @CommandLine.Option(
-                names = {"-su", "--sonatype-username"}
-        )
-        private String sonatypeUsername;
-        @CommandLine.Option(
-                names = {"-sp", "--sonatype-password"}
-        )
-        private String sonatypePassword;
-        @CommandLine.Option(
-                names = {"-sa", "--sonatype-api-key"}
-        )
-        private String sonatypeApiKey;
-        @CommandLine.Option(
-                names = {"-sb", "--sonatype-base-url"}
-        )
-        private String sonatypeUrl;
-        @CommandLine.Option(
                 names = {"-id", "--project-id"},
-                description = "Sonatype project ID."
+                required = true,
+                description = "Sonatype application ID to scan."
         )
         private int projectId;
         private final DependencyNodeFinder dependencyNodeFinder = new MavenDependencyNodeFinder();
         private final GraphGenerator graphGenerator = new GraphGenerator();
-        private final VulnerabilitiesScanner sonatypeVulnerabilitiesScanner = new SonatypeVulnerabilitiesScanner(sonatypeApiKey, sonatypeUsername, sonatypePassword, sonatypeUrl);
 
         @Override
         public void run() {
+            VulnScannerConfiguration configuration = new VulnScannerConfigStore().load();
             DependencyNode dependencyNode = dependencyNodeFinder.find(path);
             DependencyGraph graph = graphGenerator.generateGraph(dependencyNode);
-            List<Vulnerability> vulnerabiliesInfo = sonatypeVulnerabilitiesScanner.scanDependencies(projectId, dependencyNode);
+            VulnerabilitiesScanner sonatypeVulnerabilitiesScanner = new SonatypeVulnerabilitiesScanner(configuration.credentials());
+            List<Vulnerability> vulnerabilities = sonatypeVulnerabilitiesScanner.scanDependencies(projectId, dependencyNode);
+            vulnerabilities.forEach(System.out::println);
             if (svgPath != null) {
                 Path outputPath = graph.exportSvg(svgPath.normalize());
-                IO.println("Dependency graph exported to %s".formatted(outputPath));
+                System.out.println("Dependency graph exported to %s".formatted(outputPath));
             }
-
         }
     }
 }
