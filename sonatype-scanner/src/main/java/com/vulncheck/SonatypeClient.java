@@ -47,7 +47,7 @@ final class SonatypeClient {
     ) {
         Objects.requireNonNull(dependency, "dependency must not be null");
 
-        String stage = isBlank(stageId) ? "build" : stageId;
+        String stage = isBlank(stageId) ? "develop" : stageId;
 
         String path = "/api/v2/components/remediation/application/"
                 + applicationId
@@ -55,15 +55,7 @@ final class SonatypeClient {
                 + "&includeParentRemediation=" + includeParentRemediation;
 
         Map<String, Object> body = Map.of(
-                "componentIdentifier", Map.of(
-                        "format", "maven",
-                        "coordinates", Map.of(
-                                "groupId", dependency.groupId(),
-                                "artifactId", dependency.artifactId(),
-                                "version", dependency.version(),
-                                "extension", "jar"
-                        )
-                )
+                "packageUrl", dependency.toPkg("maven") + "?type=jar"
         );
 
         try {
@@ -83,6 +75,23 @@ final class SonatypeClient {
 
     private String encode(String value) {
         return URLEncoder.encode(value, StandardCharsets.UTF_8);
+    }
+
+    String resolveInternalId(String publicId) {
+        Objects.requireNonNull(publicId, "publicId must not be null");
+        JsonNode response = send("GET",
+                "/api/v2/applications?publicId=" + encode(publicId), null);
+        JsonNode applications = response.path("applications");
+        if (!applications.isArray() || applications.isEmpty()) {
+            throw new IllegalStateException(
+                    "Application with publicId '" + publicId + "' not found in Sonatype IQ");
+        }
+        String internalId = applications.get(0).path("id").asText(null);
+        if (isBlank(internalId)) {
+            throw new IllegalStateException(
+                    "Sonatype IQ returned an application without an internal ID for publicId '" + publicId + "'");
+        }
+        return internalId;
     }
 
     JsonNode scan(String applicationId, Map<String, Object> bom) {

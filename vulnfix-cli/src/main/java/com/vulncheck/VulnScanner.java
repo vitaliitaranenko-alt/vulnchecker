@@ -105,11 +105,96 @@ public class VulnScanner implements Runnable {
             DependencyGraph graph = graphGenerator.generateGraph(dependencyNode);
             VulnerabilitiesScanner sonatypeVulnerabilitiesScanner = new SonatypeVulnerabilitiesScanner(configuration.credentials());
             List<Vulnerability> vulnerabilities = sonatypeVulnerabilitiesScanner.scanDependencies(projectId, dependencyNode);
-            vulnerabilities.forEach(System.out::println);
+
+            printReport(vulnerabilities);
+
             if (svgPath != null) {
                 Path outputPath = graph.exportSvg(svgPath.normalize());
                 System.out.println("Dependency graph exported to %s".formatted(outputPath));
             }
+        }
+
+        private void printReport(List<Vulnerability> vulnerabilities) {
+            String RED = "\033[0;31m";
+            String YELLOW = "\033[1;33m";
+            String GREEN = "\033[0;32m";
+            String CYAN = "\033[0;36m";
+            String BOLD = "\033[1m";
+            String DIM = "\033[2m";
+            String RESET = "\033[0m";
+
+            System.out.println();
+            System.out.println(BOLD + "Found " + vulnerabilities.size() + " vulnerabilities" + RESET);
+            System.out.println(DIM + "─".repeat(70) + RESET);
+
+            // Group by component
+            java.util.Map<String, List<Vulnerability>> grouped = new java.util.LinkedHashMap<>();
+            for (Vulnerability v : vulnerabilities) {
+                String key = v.getGroupId() + ":" + v.getArtifactId() + ":" + v.getVersion();
+                grouped.computeIfAbsent(key, k -> new java.util.ArrayList<>()).add(v);
+            }
+
+            int fixable = 0;
+            int unfixable = 0;
+
+            for (var entry : grouped.entrySet()) {
+                List<Vulnerability> vulns = entry.getValue();
+                Vulnerability first = vulns.getFirst();
+                RemediationCandidate remediation = vulns.stream()
+                        .map(Vulnerability::getRemediationCandidate)
+                        .filter(java.util.Objects::nonNull)
+                        .findFirst()
+                        .orElse(null);
+
+                // Severity color for the worst CVE in this component
+                String sevColor = vulns.stream()
+                        .anyMatch(v -> "critical".equals(v.getSeverity())) ? RED
+                        : vulns.stream().anyMatch(v -> "severe".equals(v.getSeverity())) ? RED
+                        : YELLOW;
+
+                // Component line
+                String component = first.getGroupId() + ":" + first.getArtifactId();
+                System.out.printf("%n  %s●%s %s%s%s : %s%s", sevColor, RESET, BOLD, component, RESET, first.getVersion(), RESET);
+
+                if (remediation != null && remediation.target() != null) {
+                    System.out.printf("  →  %s%s%s", GREEN, remediation.target().version(), RESET);
+                    fixable++;
+
+                    // Parent info (transitive dependency)
+                    if (!remediation.directDependency() && remediation.parentCandidates() != null && !remediation.parentCandidates().isEmpty()) {
+                        ComponentCoordinate parent = remediation.parentCandidates().getFirst();
+                        System.out.printf("  %s(via %s:%s → %s)%s",
+                                DIM, parent.groupId(), parent.artifactId(), parent.version(), RESET);
+                    }
+
+                    System.out.printf("  %s[%s]%s", DIM, remediation.type(), RESET);
+                } else {
+                    System.out.printf("  %s(no fix available)%s", DIM, RESET);
+                    unfixable++;
+                }
+                System.out.println();
+
+                // CVE list
+                for (Vulnerability v : vulns) {
+                    String severity = v.getSeverity() != null ? v.getSeverity().toUpperCase() : "?";
+                    String sColor = switch (severity) {
+                        case "CRITICAL" -> RED;
+                        case "SEVERE" -> RED;
+                        case "MODERATE" -> YELLOW;
+                        default -> DIM;
+                    };
+                    System.out.printf("    %s%-8s%s %s%s%s%n", sColor, severity, RESET, DIM, v.getId(), RESET);
+                }
+            }
+
+            // Summary
+            System.out.println();
+            System.out.println(DIM + "─".repeat(70) + RESET);
+            System.out.printf("%s%d%s components affected, %s%s%d fixable%s, %s%d without fix%s%n",
+                    BOLD, grouped.size(), RESET,
+                    GREEN, BOLD, fixable, RESET,
+                    DIM, unfixable, RESET);
+            System.out.println();
         }
     }
 }
