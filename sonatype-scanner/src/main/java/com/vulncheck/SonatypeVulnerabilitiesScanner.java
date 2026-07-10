@@ -28,9 +28,18 @@ public class SonatypeVulnerabilitiesScanner implements VulnerabilitiesScanner {
             throw new IllegalArgumentException("projectId must not be blank");
         }
 
-        List<Vulnerability> vulnerabilities = toVulnerabilities(sonatypeClient.scan(projectId, toCycloneDxBom(dependencyNode)));
+        String internalId = sonatypeClient.resolveInternalId(projectId);
+
+        List<Vulnerability> vulnerabilities = toVulnerabilities(sonatypeClient.scan(internalId, toCycloneDxBom(dependencyNode)));
         for (Vulnerability vulnerability : vulnerabilities) {
-            Optional<RemediationCandidate> bestCandidate = findBestRemediation(projectId, dependencyNode);
+            DependencyNode vulnerableComponent = new DependencyNode(
+                    vulnerability.getArtifactId(),
+                    vulnerability.getGroupId(),
+                    vulnerability.getVersion(),
+                    null,
+                    null
+            );
+            Optional<RemediationCandidate> bestCandidate = findBestRemediation(internalId, vulnerableComponent);
             if (bestCandidate.isEmpty()) {
                 continue;
             }
@@ -47,7 +56,7 @@ public class SonatypeVulnerabilitiesScanner implements VulnerabilitiesScanner {
         JsonNode response = sonatypeClient.getRemediation(
                 applicationId,
                 dependency,
-                "build",
+                "develop",
                 true
         );
 
