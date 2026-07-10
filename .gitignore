@@ -1,0 +1,35 @@
+# Build output
+**/target/
+*.class
+
+# Generated dependency graphs
+/data/
+/svgs/
+*.dot
+
+# IntelliJ IDEA
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Eclipse
+.classpath
+.project
+.settings/
+.factorypath
+
+# VS Code
+.vscode/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# OS files and logs
+.DS_Store
+Thumbs.db
+*.log
